@@ -6,6 +6,7 @@ use serenity::model::channel::Message;
 use serenity::prelude::*;
 use std::env;
 use std::fs;
+use serenity::all::{CreateEmbed, CreateEmbedFooter};
 
 #[derive(Deserialize, Debug)]
 struct Config {
@@ -25,14 +26,9 @@ impl EventHandler for Handler {
             let total_lines = self.config.lines.len();
 
             if q_num > total_lines {
-                if let Err(why) = msg
-                    .channel_id
+                if let Err(why) = msg.channel_id
                     .say(&ctx.http, "Увы, меня сломали. Не будет тебе верифа")
-                    .await
-                {
-                    println!("Error sending message: {why:?}");
-                }
-                return;
+                    .await {println!("Error sending message: {why:?}")} return;
             }
 
             let mut lines_arr: Vec<usize> = (0..total_lines).collect();
@@ -43,15 +39,20 @@ impl EventHandler for Handler {
             }
 
             let mut shuffled_lines = Vec::new();
-            for &index in lines_arr.iter().take(q_num) {
+            for (i, &index) in lines_arr.iter().take(q_num).enumerate() {
                 let line = &self.config.lines[index];
-                shuffled_lines.push(line.clone());
+                let number = format!("{}. {}", i+1, line);
+                shuffled_lines.push(number);
             }
 
-            let message = shuffled_lines.join("\n\n");
-            if let Err(why) = msg.channel_id.say(&ctx.http, message).await {
-                println!("Err sending message: {why:?}");
-            }
+            let embed = CreateEmbed::new()
+                .title("Ответьте на следующие вопросы для продолжения:")
+                .description(shuffled_lines.join("\n\n"))
+                .footer(CreateEmbedFooter::new("Это нужно для уверенности в том, что вы не бот."));
+            if let Err(why) = msg.channel_id.send_message(&ctx.http,
+                                     // how TF does this work
+                                     serenity::builder::CreateMessage::new().embed(embed))
+                                     .await {println!("Error sending embed: {why:?}")};
         }
     }
 }
@@ -59,24 +60,18 @@ impl EventHandler for Handler {
 #[tokio::main]
 async fn main() {
     dotenv().ok();
-    let token = env::var("DISCORD_TOKEN").expect("Expected a token in the environment");
+    let token = env::var("DISCORD_TOKEN")
+        .expect("Expected a token in the environment");
+    let read_config = fs::read_to_string("config.json")
+        .expect("Err reading config file");
+    let config: Config = serde_json::from_str(&read_config)
+        .expect("Err parsing config");
 
-    let read_config = fs::read_to_string("config.json").expect("Err reading config file");
-    let config: Config = serde_json::from_str(&read_config).expect("Err parsing config");
-
-    // Set gateway intents, which decides what events the bot will be notified about
+    // what events the bot will be notified about
     let intents = GatewayIntents::GUILD_MESSAGES
         | GatewayIntents::DIRECT_MESSAGES
         | GatewayIntents::MESSAGE_CONTENT;
-
-    // Create a new instance of the Client, logging in as a bot.
     let mut client = Client::builder(&token, intents)
-        .event_handler(Handler { config })
-        .await
-        .expect("Err creating client");
-
-    // Start listening for events by starting a single shard
-    if let Err(why) = client.start().await {
-        println!("Client error: {why:?}");
-    }
+        .event_handler(Handler{config}).await.expect("Err creating client");
+    if let Err(why) = client.start().await {println!("Client error: {why:?}")}
 }
