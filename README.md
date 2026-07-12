@@ -57,9 +57,11 @@ AutoMod setup, which is also pretty restricted in its functionality.
 
 ```json5
 {
-   // the number of strings that will be chosen randomly
+  // the number of strings that will be chosen randomly
   "questions_number": 3, 
-   // the string array itself
+  // the category for channel creation
+  "category_id": 1234567890123456789,
+  // the string array itself
   "lines": [
     "first str",
     "second str",
@@ -70,4 +72,4 @@ AutoMod setup, which is also pretty restricted in its functionality.
 ```
 
 ## Available commands:
-- `!verify` - send 3 random strings from `config.json` to a Discord channel the command was called from.
+- `!init` - send the initial message.
