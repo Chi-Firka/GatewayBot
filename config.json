@@ -1,6 +1,9 @@
 {
   "questions_number": 3,
   "category_id": 1234567890123456789,
+  "log_channel_id": 9876543210987654321,
+  "moderator_role_ids": [111222333444555666, 777888999000111222],
+  "verified_role_ids": [999888777666555444],
   "lines": [
     "first str",
     "second str",
