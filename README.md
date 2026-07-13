@@ -50,6 +50,10 @@ AutoMod setup, which is also pretty restricted in its functionality.
    cargo run
    ```
 
+> [!TIP]
+> Create an attachments/ folder to automatically 
+> include random spoiler attachments in verification messages.
+
 ---
 
 ## Available commands:
