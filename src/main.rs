@@ -1,11 +1,9 @@
+use std::path::Path;
+use std::collections::HashMap;
 use dotenvy::dotenv;
 use rand::seq::SliceRandom;
 use serde::Deserialize;
-use serenity::all::{
-    ButtonStyle, ChannelId, ChannelType, ComponentInteraction, CreateButton, CreateEmbed,
-    CreateEmbedFooter, CreateMessage, Interaction, PermissionOverwrite, PermissionOverwriteType,
-    Permissions, RoleId, Timestamp, UserId,
-};
+use serenity::all::{ButtonStyle, ChannelId, ChannelType, ComponentInteraction, CreateAllowedMentions, CreateAttachment, CreateButton, CreateEmbed, CreateEmbedFooter, CreateMessage, Http, Interaction, PermissionOverwrite, PermissionOverwriteType, Permissions, RoleId, Timestamp, UserId};
 use serenity::async_trait;
 use serenity::builder::{
     CreateChannel, CreateInteractionResponse, CreateInteractionResponseMessage,
@@ -14,10 +12,14 @@ use serenity::model::channel::Message;
 use serenity::prelude::*;
 use std::env;
 use std::fs;
+use std::sync::Arc;
+use rand::prelude::IndexedRandom;
 
 #[derive(Deserialize, Debug)]
 struct Config {
     questions_number: usize,
+    delete_delay_seconds: u64,
+    auto_delete_on_verdict: bool,
     category_id: u64,
     log_channel_id: u64,
     moderator_role_ids: Vec<u64>,
@@ -27,6 +29,7 @@ struct Config {
 
 struct Handler {
     config: Config,
+    active_deletions: Arc<Mutex<HashMap<ChannelId, tokio::sync::oneshot::Sender<()>>>>
 }
 
 fn is_admin(ctx: &Context, msg: &Message) -> bool {
@@ -70,11 +73,88 @@ async fn extract_user_id_from_channel(ctx: &Context, channel_id: ChannelId) -> O
     Some(UserId::new(target_user_id))
 }
 
+async fn start_channel_deletion_timer(
+    channel_id: ChannelId,
+    config: &Config,
+    delay_override: u64,
+    active_deletions: Arc<Mutex<HashMap<ChannelId, tokio::sync::oneshot::Sender<()>>>>,
+    http: Arc<Http>,
+) {
+    let mut deletions = active_deletions.lock().await;
+
+    if deletions.contains_key(&channel_id) {
+        return;
+    }
+
+    let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
+    deletions.insert(channel_id, cancel_tx);
+    drop(deletions);
+
+    let delay;
+    if delay_override > 0 {
+        delay = delay_override;
+    } else {
+        delay = config.delete_delay_seconds;
+    }
+
+    let deletions_clone = active_deletions.clone();
+
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = tokio::time::sleep(tokio::time::Duration::from_secs(delay)) => {
+                let mut deletions = deletions_clone.lock().await;
+                deletions.remove(&channel_id);
+                drop(deletions);
+
+                let _ = channel_id.delete(&http).await;
+            }
+            _ = cancel_rx => {}
+        }
+    });
+}
+
 async fn send_log(ctx: &Context, log_channel_id: u64, text: String) {
     let log_channel = ChannelId::new(log_channel_id);
+    // mute all pings
+    let allowed_mentions = CreateAllowedMentions::new();
     let _ = log_channel
-        .send_message(&ctx.http, CreateMessage::new().content(text))
+        .send_message(
+            &ctx.http,
+            CreateMessage::new()
+                .content(text)
+                .allowed_mentions(allowed_mentions)
+        )
         .await;
+}
+
+async fn get_random_attachment() -> Option<CreateAttachment> {
+    let path = Path::new("attachments");
+    let entries = fs::read_dir(path).ok()?;
+    let mut files = Vec::new();
+
+    for entry in entries.flatten() {
+        if let Ok(file_type) = entry.file_type() {
+            if file_type.is_file() {
+                files.push(entry.path());
+            }
+        }
+    }
+    if files.is_empty() {
+        return None;
+    }
+
+    let chosen_path = {
+        let mut rng = rand::rng();
+        files.choose(&mut rng)?.clone()
+    };
+
+    // make a spoiler
+    let file_name = chosen_path.file_name()?.to_str()?;
+    let spoiler_name = format!("SPOILER_{}", file_name);
+    let mut attachment = CreateAttachment::path(chosen_path).await.ok()?;
+    attachment.filename = spoiler_name;
+
+    Some(attachment)
 }
 
 #[async_trait]
@@ -181,32 +261,39 @@ impl EventHandler for Handler {
                     .description(shuffled_lines.join("\n\n"))
                     .footer(CreateEmbedFooter::new("Это проверка на то, что вы не бот."));
                 // send messages
-                let _ = new_channel
-                    .id
-                    .send_message(
-                        &ctx.http,
-                        CreateMessage::new()
-                            .content(format!(
-                                "<@{}> :wave:\n\
-                                -# Аккаунт создан <t:{}:R>\n",
-                                component.user.id,
-                                component.user.id.created_at().unix_timestamp()
-                            ))
-                            .embed(embed)
-                            .button(
-                                CreateButton::new("accept_button")
-                                    .emoji('🛡')
-                                    .label("Принять")
-                                    .style(ButtonStyle::Success),
-                            )
-                            .button(
-                                CreateButton::new("deny_button")
-                                    .emoji('🛡')
-                                    .label("Отклонить")
-                                    .style(ButtonStyle::Danger),
-                            ),
+                let mut message_builder = CreateMessage::new()
+                    .content(format!(
+                        "<@{}> :wave:\n\
+                        -# Аккаунт создан <t:{}:R>\n",
+                        component.user.id,
+                        component.user.id.created_at().unix_timestamp()
+                    ))
+                    .embed(embed)
+                    .button(
+                        CreateButton::new("accept_button")
+                            .emoji('🛡')
+                            .label("Принять")
+                            .style(ButtonStyle::Success)
                     )
-                    .await;
+                    .button(
+                        CreateButton::new("deny_button")
+                            .emoji('🛡')
+                            .label("Отклонить")
+                            .style(ButtonStyle::Danger)
+                    )
+                    .button(
+                        CreateButton::new("initiate_delete_button")
+                            .emoji('🗑')
+                            .label("Удалить")
+                            .style(ButtonStyle::Secondary)
+                    );
+
+                if let Some(attachment) = get_random_attachment().await {
+                    message_builder = message_builder.add_file(attachment);
+                }
+
+                let _ = new_channel.id.send_message(&ctx.http, message_builder).await;
+
                 let _ = component
                     .create_response(
                         &ctx.http,
@@ -229,7 +316,11 @@ impl EventHandler for Handler {
 
         let is_accept = component.data.custom_id == "accept_button";
         let is_deny = component.data.custom_id == "deny_button";
+        let is_init_delete = component.data.custom_id == "initiate_delete_button";
+        let is_delete_now = component.data.custom_id == "delete_now_button";
+        let is_cancel_delete = component.data.custom_id == "cancel_delete_button";
 
+        const AUTO_DELETE_DELAY_OVERRIDE: u64 = 2;
         if is_accept || is_deny {
             if !is_moderator(&self.config, &component) {
                 let _ = component
@@ -284,6 +375,12 @@ impl EventHandler for Handler {
                                     .label("Отклонить")
                                     .style(ButtonStyle::Danger)
                                     .disabled(true),
+                            )
+                            .button(
+                                CreateButton::new("initiate_delete_button")
+                                    .emoji('🗑')
+                                    .label("Удалить")
+                                    .style(ButtonStyle::Secondary)
                             ),
                     ),
                 )
@@ -293,6 +390,12 @@ impl EventHandler for Handler {
                 .channel_id
                 .delete_permission(&ctx.http, PermissionOverwriteType::Member(target_user))
                 .await;
+            // get member's name from cache
+            let target_user_obj = target_user.to_user(&ctx.http).await;
+            let target_user_name = match &target_user_obj {
+                Ok(user) => format!("(`{}`)", user.name),
+                Err(_) => String::new(),
+            };
 
             if is_accept {
                 // give verified roles
@@ -303,16 +406,127 @@ impl EventHandler for Handler {
                         .await;
                 }
                 let log_text = format!(
-                    "✅ Участник <@{}> (`{}`) **принят** модератором <@{}> <t:{timestamp}:R>",
-                    target_user, component.user.name, component.user.id
+                    "✅ Участник <@{target_user}> {target_user_name} **принят** модератором <@{}> <t:{timestamp}:R>",
+                    component.user.id
                 );
                 send_log(&ctx, self.config.log_channel_id, log_text).await;
             } else if is_deny {
                 let log_text = format!(
-                    "❌ Участник <@{}> (`{}`) **отклонён** модератором <@{}> <t:{timestamp}:R>",
-                    target_user, component.user.name, component.user.id
+                    "❌ Участник <@{target_user}> {target_user_name} **отклонён** модератором <@{}> <t:{timestamp}:R>",
+                    component.user.id
                 );
                 send_log(&ctx, self.config.log_channel_id, log_text).await;
+            }
+
+            if self.config.auto_delete_on_verdict {
+                let deletions = self.active_deletions.lock().await;
+                if !deletions.contains_key(&component.channel_id) {
+                    drop(deletions);
+
+                    let delay_override = self.config.delete_delay_seconds * AUTO_DELETE_DELAY_OVERRIDE;
+
+                    start_channel_deletion_timer(
+                        component.channel_id,
+                        &self.config,
+                        delay_override,
+                        self.active_deletions.clone(),
+                        ctx.http.clone(),
+                    ).await;
+
+                    let delete_timestamp = Timestamp::now().unix_timestamp() + delay_override as i64;
+
+                    let _ = component.channel_id.send_message(&ctx.http,
+                              CreateMessage::new()
+                                  .content(format!("Этот канал автоматически удалится <t:{delete_timestamp}:R>."))
+                                  .button(
+                                      CreateButton::new("delete_now_button")
+                                          .label("Удалить сейчас")
+                                          .style(ButtonStyle::Danger)
+                                  )
+                                  .button(
+                                      CreateButton::new("cancel_delete_button")
+                                          .label("Отменить автоудаление")
+                                          .style(ButtonStyle::Secondary)
+                                  ),
+                    ).await;
+                } else {
+                    drop(deletions);
+                }
+            }
+        }
+
+        let channel_id = component.channel_id;
+
+        if is_init_delete || is_delete_now || is_cancel_delete {
+            if !is_moderator(&self.config, &component) {
+                let _ = component
+                    .create_response(
+                        &ctx.http,
+                        CreateInteractionResponse::Message(
+                            CreateInteractionResponseMessage::new()
+                                .content("Недостаточно прав.")
+                                .ephemeral(true),
+                        ),
+                    )
+                    .await;
+                return;
+            }
+
+            if is_init_delete {
+                let deletions = self.active_deletions.lock().await;
+                if deletions.contains_key(&channel_id) {
+                    let _ = component.create_response(&ctx.http, CreateInteractionResponse::Message(
+                        CreateInteractionResponseMessage::new()
+                            .content("Удаление уже в процессе!")
+                            .ephemeral(true)
+                    )).await;
+                    return;
+                }
+                drop(deletions);
+
+                start_channel_deletion_timer(
+                    channel_id,
+                    &self.config,
+                    0,
+                    self.active_deletions.clone(),
+                    ctx.http.clone()
+                ).await;
+
+                let delay = self.config.delete_delay_seconds;
+                let delete_timestamp = Timestamp::now().unix_timestamp() + delay as i64;
+
+                let _ = component.create_response(&ctx.http, CreateInteractionResponse::Message(
+                    CreateInteractionResponseMessage::new()
+                        .content(format!("Этот канал будет удалён <t:{delete_timestamp}:R>."))
+                        .button(
+                            CreateButton::new("delete_now_button")
+                                .label("Удалить сейчас")
+                                .style(ButtonStyle::Danger)
+                        )
+                        .button(
+                            CreateButton::new("cancel_delete_button")
+                                .label("Отменить")
+                                .style(ButtonStyle::Secondary)
+                        ),
+                ),
+                ).await;
+            }
+
+            if is_delete_now {
+                let mut deletions = self.active_deletions.lock().await;
+                deletions.remove(&channel_id);
+                drop(deletions);
+                let _ = channel_id.delete(&ctx.http).await;
+            }
+
+            if is_cancel_delete {
+                let mut deletions = self.active_deletions.lock().await;
+                if let Some(cancel_tx) = deletions.remove(&channel_id) {
+                    let _ = cancel_tx.send(());
+                }
+                drop(deletions);
+                let _ = channel_id.delete_message(&ctx.http, component.message.id).await;
+                let _ = component.create_response(&ctx.http, CreateInteractionResponse::Acknowledge).await;
             }
         }
     }
@@ -331,7 +545,10 @@ async fn main() {
         | GatewayIntents::MESSAGE_CONTENT
         | GatewayIntents::GUILDS;
     let mut client = Client::builder(&token, intents)
-        .event_handler(Handler { config })
+        .event_handler(Handler {
+            config,
+            active_deletions: Arc::new(Mutex::new(HashMap::new()))
+        })
         .await
         .expect("Err creating client");
     if let Err(why) = client.start().await {

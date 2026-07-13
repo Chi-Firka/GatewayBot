@@ -59,8 +59,11 @@ AutoMod setup, which is also pretty restricted in its functionality.
 ## Config format:
 ```json5
 {
-  // the number of strings that will be chosen randomly
-  "questions_number": 3, 
+  // the number of strings that will be chosen RANDOMLY
+  "questions_number": 3,
+  // some obvious stuff
+  "delete_delay_seconds": 60,
+  "auto_delete_on_verdict": true,
   // the category for channel creation
   "category_id": 1234567890123456789,
   // self-explanatory imo

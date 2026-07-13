@@ -1,5 +1,7 @@
 {
   "questions_number": 3,
+  "delete_delay_seconds": 60,
+  "auto_delete_on_verdict": true,
   "category_id": 1234567890123456789,
   "log_channel_id": 9876543210987654321,
   "moderator_role_ids": [111222333444555666, 777888999000111222],
